@@ -17,37 +17,419 @@ var sax = require('sax')
   , utils = require('./utils')
   ;
 
-function reresolve (node, baseurl) {
+/**
+ * FeedParser constructor. Most apps will only use one instance.
+ *
+ * @api public
+ */
+function FeedParser (options) {
 
-  if (!node || !baseurl) {
-    return false; // Nothing to do.
+  this._reset();
+  this.options = options || {};
+  if (!('strict' in this.options)) this.options.strict = false;
+  if (!('normalize' in this.options)) this.options.normalize = true;
+  if (!('addmeta' in this.options)) this.options.addmeta = true;
+  if (this.options.feedurl) this.xmlbase.unshift({ '#name': 'xml', '#': this.options.feedurl});
+  this.stream = sax.createStream(this.options.strict /* strict mode - no by default */, {lowercase: true, xmlns: true }); // https://github.com/isaacs/sax-js
+  this.stream.on('error', this.handleError.bind(this, this.handleSaxError.bind(this)));//function (e){ this.handleSaxError(e, this); });
+  this.stream.on('opentag', this.handleOpenTag.bind(this));//function (n){ this.handleOpenTag(n, this); });
+  this.stream.on('closetag',this.handleCloseTag.bind(this));//function (el){ this.handleCloseTag(el, this); });
+  this.stream.on('text', this.handleText.bind(this));//function (text){ this.handleText(text, this); });
+  this.stream.on('cdata', this.handleText.bind(this));//function (text){ this.handleText(text, this); });
+  this.stream.on('end', this.handleEnd.bind(this));//function (){ this.handleEnd(this); });
+  EventEmitter.call(this);
+}
+util.inherits(FeedParser, EventEmitter);
+
+/**
+ * Parses a feed contained in a string.
+ *
+ * For each article/post in a feed, emits an 'article' event
+ * with an object with the following keys:
+ *   title {String}
+ *   description {String}
+ *   summary {String}
+ *   date {Date} (or null)
+ *   pubdate {Date} (or null)
+ *   link {String}
+ *   origlink {String}
+ *   author {String}
+ *   guid {String}
+ *   comments {String}
+ *   image {Object}
+ *   categories {Array}
+ *   source {Object}
+ *   enclosures {Array}
+ *   meta {Object}
+ *   Object.keys(meta):
+ *     #ns {Array} key,value pairs of each namespace declared for the feed
+ *     #type {String} one of 'atom', 'rss', 'rdf'
+ *     #version {String}
+ *     title {String}
+ *     description {String}
+ *     date {Date} (or null)
+ *     pubdate {Date} (or null)
+ *     link {String} i.e., to the website, not the feed
+ *     xmlurl {String} the canonical URL of the feed, as declared by the feed
+ *     author {String}
+ *     language {String}
+ *     image {Object}
+ *     favicon {String}
+ *     copyright {String}
+ *     generator {String}
+ *     categories {Array}
+ *
+ * Emits a 'warning' event on each XML parser warning
+ *
+ * Emits an 'error' event on each XML parser error
+ *
+ * @param {String} string of XML representing the feed
+ * @param {Function} callback
+ * @api public
+ */
+
+FeedParser.prototype.parseString = function(string, options, callback) {
+  if (arguments.length === 2 && typeof options === 'function') {
+    callback = options;
+    options = null;
+  }
+  if (options) {
+    if ('normalize' in options) this.options.normalize = options.normalize;
+    if ('addmeta' in options) this.options.addmeta = options.addmeta;
+    if (options.feedurl) this.xmlbase.unshift({ '#name': 'xml', '#': options.feedurl});
+  }
+  this._setCallback(callback);
+  this.stream
+    .on('error', this.handleError.bind(this))
+    .end(string, 'utf8');
+};
+
+/**
+ * Parses a feed from a file or (for compatability with libxml) a url.
+ * See parseString for more info.
+ *
+ * @param {String} path to the feed file or a fully qualified uri or parsed url object from url.parse()
+ * @param {Function} callback
+ * @api public
+ */
+
+FeedParser.prototype.parseFile = function(file, options, callback) {
+  if (/^https?:/.test(file) || (typeof file === 'object' && 'protocol' in file)) {
+    return this.parseUrl.call(this, file, options, callback);
   }
 
-  function resolveLevel (level) {
-    var els = Object.keys(level);
-    els.forEach(function(el){
-      if (Array.isArray(level[el])) {
-        level[el].forEach(resolveLevel);
-      } else {
-        if (level[el].constructor.name === 'Object') {
-          if (el == 'logo' || el == 'icon') {
-            level[el]['#'] = utils.resolve(baseurl, level[el]['#']);
-          } else {
-            var attrs = Object.keys(level[el]);
-            attrs.forEach(function(name){
-              if (name == 'href' || name == 'src' || name == 'uri') {
-                level[el][name] = utils.resolve(baseurl, level[el][name]);
-              }
-            });
+  if (arguments.length === 2 && typeof options === 'function') {
+    callback = options;
+    options = null;
+  }
+  if (options) {
+    if ('normalize' in options) this.options.normalize = options.normalize;
+    if ('addmeta' in options) this.options.addmeta = options.addmeta;
+    if (options.feedurl) this.xmlbase.unshift({ '#name': 'xml', '#': options.feedurl});
+  }
+  this._setCallback(callback);
+  fs.createReadStream(file)
+    .on('error', this.handleError.bind(this))
+    .pipe(this.stream);
+};
+
+/**
+ * Parses a feed from a url.
+ *
+ * Please consider whether it would be better to perform conditional GETs
+ * and pass in the results instead.
+ *
+ * See parseString for more info.
+ *
+ * @param {String} fully qualified uri or a parsed url object from url.parse()
+ * @param {Function} callback
+ * @api public
+ */
+
+FeedParser.prototype.parseUrl = function(url, options, callback) {
+  if (arguments.length === 2 && typeof options === 'function') {
+    callback = options;
+    options = null;
+  }
+  if (options) {
+    if ('normalize' in options) this.options.normalize = options.normalize;
+    if ('addmeta' in options) this.options.addmeta = options.addmeta;
+  }
+  if (!this.xmlbase.length) { // #parseFile may have already populated this value
+    if (/^https?:/.test(url)) {
+      this.xmlbase.unshift({ '#name': 'xml', '#': url});
+    } else if (typeof url == 'object' && 'href' in url) {
+      this.xmlbase.unshift({ '#name': 'xml', '#': url.href});
+    }
+  }
+  this._setCallback(callback);
+  request(url)
+    .on('error', this.handleError.bind(this))
+    .pipe(this.stream);
+};
+
+/**
+ * Parses a feed from a Stream.
+ *
+ * Example:
+ *    fp = new FeedParser();
+ *    fp.on('article', function (article){ // do something });
+ *    fp.parseStream(fs.createReadStream('file.xml')[, callback]);
+ *
+ *
+ * See parseString for more info.
+ *
+ * @param {Readable Stream}
+ * @param {Function} callback
+ * @api public
+ */
+
+FeedParser.prototype.parseStream = function(stream, options, callback) {
+  if (arguments.length === 2 && typeof options === 'function') {
+    callback = options;
+    options = null;
+  }
+  if (options) {
+    if ('normalize' in options) this.options.normalize = options.normalize;
+    if ('addmeta' in options) this.options.addmeta = options.addmeta;
+    if (options.feedurl) this.xmlbase.unshift({ '#name': 'xml', '#': options.feedurl});
+  }
+  this._setCallback(callback);
+  stream
+    .on('error', this.handleError.bind(this))
+    .pipe(this.stream);
+};
+
+FeedParser.prototype.handleEnd = function (){
+  this.emit('end', this.articles);
+
+  if ('function' === typeof this.callback) {
+    if (this.errors.length) {
+      var error = this.errors.pop();
+      if (this.errors.length) {
+        error.errors = this.errors;
+      }
+      this.callback(error);
+    } else {
+      this.callback(null, this.meta, this.articles);
+    }
+  }
+  this._reset();
+};
+
+FeedParser.prototype.handleSaxError = function (){
+  if (this._parser) {
+    this._parser.error = null;
+    this._parser.resume();
+  }
+};
+
+FeedParser.prototype.handleError = function (next, e){
+  // A SaxError will prepend an error-handling callback,
+  // but other calls to #handleError will not
+  if (next && !e) {
+    e = next;
+    next = null;
+  }
+  // Only emit the error event if we are not using CPS or
+  // if we have a listener on 'error' even if we are using CPS
+  if (!this.callback || this.listeners('error').length) {
+    this.emit('error', e);
+  }
+  this.errors.push(e);
+  if (typeof next === 'function') {
+    next();
+  } else {
+    this.handleEnd(this);
+  }
+};
+
+FeedParser.prototype.handleOpenTag = function (node){
+  var n = {};
+  n['#name'] = node.name; // Avoid namespace collissions later...
+  n['#prefix'] = node.prefix; // The current ns prefix
+  n['#local'] = node.local; // The current element name, sans prefix
+  n['#uri'] = node.uri; // The current ns uri
+  n['@'] = {};
+  n['#'] = '';
+
+  if (Object.keys(node.attributes).length) {
+    n['@'] = this.handleAttributes(node.attributes, n['#name']);
+  }
+
+  if (this.in_xhtml && this.xhtml['#name'] != n['#name']) { // We are in an xhtml node
+    // This builds the opening tag, e.g., <div id='foo' class='bar'>
+    this.xhtml['#'] += '<'+n['#name'];
+    Object.keys(n['@']).forEach(function(name){
+      this.xhtml['#'] += ' '+ name +'="'+ n['@'][name] + '"';
+    }, this);
+    this.xhtml['#'] += '>';
+  } else if ( this.stack.length === 0 &&
+              (n['#name'] === 'rss' ||
+              (n['#local'] === 'rdf' && utils.nslookup([n['#uri']], 'rdf')) ||
+              (n['#local'] === 'feed'&& utils.nslookup([n['#uri']], 'atom')) ) ) {
+    Object.keys(n['@']).forEach(function(name) {
+      var o = {};
+      if (name != 'version') {
+        o[name] = n['@'][name];
+        this.meta['@'].push(o);
+      }
+    }, this);
+    switch(n['#local']) {
+    case 'rss':
+      this.meta['#type'] = 'rss';
+      this.meta['#version'] = n['@']['version'];
+      break;
+    case 'rdf':
+      this.meta['#type'] = 'rdf';
+      this.meta['#version'] = n['@']['version'] || '1.0';
+      break;
+    case 'feed':
+      this.meta['#type'] = 'atom';
+      this.meta['#version'] = n['@']['version'] || '1.0';
+      break;
+    }
+  }
+  this.stack.unshift(n);
+};
+
+FeedParser.prototype.handleCloseTag = function (el){
+  var node = { '#name' : el
+             , '#prefix' : ''
+             , '#local' : '' }
+    , stdEl
+    , item
+    , baseurl
+    ;
+  var n = this.stack.shift();
+  el = el.split(':');
+
+  if (el.length > 1 && el[0] === n['#prefix']) {
+    if (utils.nslookup(n['#uri'], 'atom')) {
+      node['#prefix'] = el[0];
+      node['#local'] = el.slice(1).join(':');
+      node['#type'] = 'atom';
+    } else if (utils.nslookup(n['#uri'], 'rdf')) {
+      node['#prefix'] = el[0];
+      node['#local'] = el.slice(1).join(':');
+      node['#type'] = 'rdf';
+    } else {
+      node['#prefix'] = utils.nsprefix(n['#uri']) || n['#prefix'];
+      node['#local'] = el.slice(1).join(':');
+    }
+  } else {
+    node['#local'] = node['#name'];
+    node['#type'] = utils.nsprefix(n['#uri']) || n['#prefix'];
+  }
+  delete n['#name'];
+  delete n['#local'];
+  delete n['#prefix'];
+  delete n['#uri'];
+
+  if (this.xmlbase && this.xmlbase.length) {
+    baseurl = this.xmlbase[0]['#'];
+  }
+
+  if (baseurl && (node['#local'] === 'logo' || node['#local'] === 'icon') && node['#type'] === 'atom') {
+    // Apply xml:base to these elements as they appear
+    // rather than leaving it to the ultimate parser
+    n['#'] = utils.resolve(baseurl, n['#']);
+  }
+
+  if (this.xmlbase.length && (el == this.xmlbase[0]['#name'])) {
+    void this.xmlbase.shift();
+  }
+
+  if (this.in_xhtml) {
+    if (node['#name'] == this.xhtml['#name']) { // The end of the XHTML
+
+      // Add xhtml data to the container element
+      n['#'] += this.xhtml['#'].trim();
+        // Clear xhtml nodes from the tree
+        for (var key in n) {
+          if (key != '@' && key != '#') {
+            delete n[key];
           }
         }
-      }
-    });
-    return level;
+      this.xhtml = {};
+      this.in_xhtml = false;
+    } else { // Somewhere in the middle of the XHTML
+      this.xhtml['#'] += '</' + node['#name'] + '>';
+    }
   }
 
-  return resolveLevel(node);
-}
+  if ('#' in n) {
+    if (n['#'].match(/^\s*$/)) {
+      // Delete text nodes with nothing by whitespace
+      delete n['#'];
+    } else {
+      n['#'] = n['#'].trim();
+      if (Object.keys(n).length === 1) {
+        // If there is only one text node, hoist it
+        n = n['#'];
+      }
+    }
+  }
+
+  if (node['#name'] === 'item' ||
+      node['#name'] === 'entry' ||
+      (node['#local'] === 'item' && (node['#prefix'] === '' || node['#type'] === 'rdf')) ||
+      (node['#local'] == 'entry' && (node['#prefix'] === '' || node['#type'] === 'atom'))) { // We have an article!
+
+    if (!this.meta.title) { // We haven't yet parsed all the metadata
+      utils.merge(this.meta, this.handleMeta(this.stack[0], this.meta['#type'], this.options));
+      this.emit('meta', this.meta);
+    }
+    if (!baseurl && this.xmlbase && this.xmlbase.length) { // handleMeta was able to infer a baseurl without xml:base or options.feedurl
+      n = reresolve(n, this.xmlbase[0]['#']);
+    }
+    item = this.handleItem(n, this.meta['#type'], this.options);
+    if (this.options.addmeta) {
+      item.meta = this.meta;
+    }
+    if (this.meta.author && !item.author) item.author = this.meta.author;
+    this.emit('article', item);
+    this.articles.push(item);
+  } else if (!this.meta.title && // We haven't yet parsed all the metadata
+              (node['#name'] === 'channel' ||
+               node['#name'] === 'feed' ||
+               (node['#local'] === 'channel' && (node['#prefix'] === '' || node['#type'] === 'rdf')) ||
+               (node['#local'] === 'feed' && (node['#prefix'] === '' || node['#type'] === 'atom')) ) ) {
+    utils.merge(this.meta, this.handleMeta(n, this.meta['#type'], this.options));
+    this.emit('meta', this.meta);
+  }
+
+  if (this.stack.length > 0) {
+    if (node['#prefix'] && node['#local'] && !node['#type']) {
+      stdEl = node['#prefix'] + ':' + node['#local'];
+    } else {
+      stdEl = node['#local'] || node['#name'];
+    }
+    if (!this.stack[0].hasOwnProperty(stdEl)) {
+      this.stack[0][stdEl] = n;
+    } else if (this.stack[0][stdEl] instanceof Array) {
+      this.stack[0][stdEl].push(n);
+    } else {
+      this.stack[0][stdEl] = [this.stack[0][stdEl], n];
+    }
+  } else {
+    this.nodes = n;
+  }
+};
+
+FeedParser.prototype.handleText = function (text){
+  if (this.in_xhtml) {
+    this.xhtml['#'] += text;
+  } else {
+    if (this.stack.length) {
+      if ('#' in this.stack[0]) {
+        this.stack[0]['#'] += text;
+      } else {
+        this.stack[0]['#'] = text;
+      }
+    }
+  }
+};
 
 FeedParser.prototype.handleAttributes = function handleAttributes (attrs, el) {
   /*
@@ -574,420 +956,6 @@ FeedParser.prototype.handleItem = function handleItem (node, type, options){
   return item;
 }
 
-/**
- * FeedParser constructor. Most apps will only use one instance.
- *
- * @api public
- */
-function FeedParser (options) {
-
-  this._reset();
-  this.options = options || {};
-  if (!('strict' in this.options)) this.options.strict = false;
-  if (!('normalize' in this.options)) this.options.normalize = true;
-  if (!('addmeta' in this.options)) this.options.addmeta = true;
-  if (this.options.feedurl) this.xmlbase.unshift({ '#name': 'xml', '#': this.options.feedurl});
-  this.stream = sax.createStream(this.options.strict /* strict mode - no by default */, {lowercase: true, xmlns: true }); // https://github.com/isaacs/sax-js
-  this.stream.on('error', this.handleError.bind(this, this.handleSaxError.bind(this)));//function (e){ this.handleSaxError(e, this); });
-  this.stream.on('opentag', this.handleOpenTag.bind(this));//function (n){ this.handleOpenTag(n, this); });
-  this.stream.on('closetag',this.handleCloseTag.bind(this));//function (el){ this.handleCloseTag(el, this); });
-  this.stream.on('text', this.handleText.bind(this));//function (text){ this.handleText(text, this); });
-  this.stream.on('cdata', this.handleText.bind(this));//function (text){ this.handleText(text, this); });
-  this.stream.on('end', this.handleEnd.bind(this));//function (){ this.handleEnd(this); });
-  EventEmitter.call(this);
-}
-util.inherits(FeedParser, EventEmitter);
-
-/**
- * Parses a feed contained in a string.
- *
- * For each article/post in a feed, emits an 'article' event
- * with an object with the following keys:
- *   title {String}
- *   description {String}
- *   summary {String}
- *   date {Date} (or null)
- *   pubdate {Date} (or null)
- *   link {String}
- *   origlink {String}
- *   author {String}
- *   guid {String}
- *   comments {String}
- *   image {Object}
- *   categories {Array}
- *   source {Object}
- *   enclosures {Array}
- *   meta {Object}
- *   Object.keys(meta):
- *     #ns {Array} key,value pairs of each namespace declared for the feed
- *     #type {String} one of 'atom', 'rss', 'rdf'
- *     #version {String}
- *     title {String}
- *     description {String}
- *     date {Date} (or null)
- *     pubdate {Date} (or null)
- *     link {String} i.e., to the website, not the feed
- *     xmlurl {String} the canonical URL of the feed, as declared by the feed
- *     author {String}
- *     language {String}
- *     image {Object}
- *     favicon {String}
- *     copyright {String}
- *     generator {String}
- *     categories {Array}
- *
- * Emits a 'warning' event on each XML parser warning
- *
- * Emits an 'error' event on each XML parser error
- *
- * @param {String} string of XML representing the feed
- * @param {Function} callback
- * @api public
- */
-
-FeedParser.prototype.parseString = function(string, options, callback) {
-  if (arguments.length === 2 && typeof options === 'function') {
-    callback = options;
-    options = null;
-  }
-  if (options) {
-    if ('normalize' in options) this.options.normalize = options.normalize;
-    if ('addmeta' in options) this.options.addmeta = options.addmeta;
-    if (options.feedurl) this.xmlbase.unshift({ '#name': 'xml', '#': options.feedurl});
-  }
-  this._setCallback(callback);
-  this.stream
-    .on('error', this.handleError.bind(this))
-    .end(string, 'utf8');
-};
-
-/**
- * Parses a feed from a file or (for compatability with libxml) a url.
- * See parseString for more info.
- *
- * @param {String} path to the feed file or a fully qualified uri or parsed url object from url.parse()
- * @param {Function} callback
- * @api public
- */
-
-FeedParser.prototype.parseFile = function(file, options, callback) {
-  if (/^https?:/.test(file) || (typeof file === 'object' && 'protocol' in file)) {
-    return this.parseUrl.call(this, file, options, callback);
-  }
-
-  if (arguments.length === 2 && typeof options === 'function') {
-    callback = options;
-    options = null;
-  }
-  if (options) {
-    if ('normalize' in options) this.options.normalize = options.normalize;
-    if ('addmeta' in options) this.options.addmeta = options.addmeta;
-    if (options.feedurl) this.xmlbase.unshift({ '#name': 'xml', '#': options.feedurl});
-  }
-  this._setCallback(callback);
-  fs.createReadStream(file)
-    .on('error', this.handleError.bind(this))
-    .pipe(this.stream);
-};
-
-/**
- * Parses a feed from a url.
- *
- * Please consider whether it would be better to perform conditional GETs
- * and pass in the results instead.
- *
- * See parseString for more info.
- *
- * @param {String} fully qualified uri or a parsed url object from url.parse()
- * @param {Function} callback
- * @api public
- */
-
-FeedParser.prototype.parseUrl = function(url, options, callback) {
-  if (arguments.length === 2 && typeof options === 'function') {
-    callback = options;
-    options = null;
-  }
-  if (options) {
-    if ('normalize' in options) this.options.normalize = options.normalize;
-    if ('addmeta' in options) this.options.addmeta = options.addmeta;
-  }
-  if (!this.xmlbase.length) { // #parseFile may have already populated this value
-    if (/^https?:/.test(url)) {
-      this.xmlbase.unshift({ '#name': 'xml', '#': url});
-    } else if (typeof url == 'object' && 'href' in url) {
-      this.xmlbase.unshift({ '#name': 'xml', '#': url.href});
-    }
-  }
-  this._setCallback(callback);
-  request(url)
-    .on('error', this.handleError.bind(this))
-    .pipe(this.stream);
-};
-
-/**
- * Parses a feed from a Stream.
- *
- * Example:
- *    fp = new FeedParser();
- *    fp.on('article', function (article){ // do something });
- *    fp.parseStream(fs.createReadStream('file.xml')[, callback]);
- *
- *
- * See parseString for more info.
- *
- * @param {Readable Stream}
- * @param {Function} callback
- * @api public
- */
-
-FeedParser.prototype.parseStream = function(stream, options, callback) {
-  if (arguments.length === 2 && typeof options === 'function') {
-    callback = options;
-    options = null;
-  }
-  if (options) {
-    if ('normalize' in options) this.options.normalize = options.normalize;
-    if ('addmeta' in options) this.options.addmeta = options.addmeta;
-    if (options.feedurl) this.xmlbase.unshift({ '#name': 'xml', '#': options.feedurl});
-  }
-  this._setCallback(callback);
-  stream
-    .on('error', this.handleError.bind(this))
-    .pipe(this.stream);
-};
-
-FeedParser.prototype.handleEnd = function (){
-  this.emit('end', this.articles);
-
-  if ('function' === typeof this.callback) {
-    if (this.errors.length) {
-      var error = this.errors.pop();
-      if (this.errors.length) {
-        error.errors = this.errors;
-      }
-      this.callback(error);
-    } else {
-      this.callback(null, this.meta, this.articles);
-    }
-  }
-  this._reset();
-};
-
-FeedParser.prototype.handleSaxError = function (){
-  if (this._parser) {
-    this._parser.error = null;
-    this._parser.resume();
-  }
-};
-
-FeedParser.prototype.handleError = function (next, e){
-  // A SaxError will prepend an error-handling callback,
-  // but other calls to #handleError will not
-  if (next && !e) {
-    e = next;
-    next = null;
-  }
-  // Only emit the error event if we are not using CPS or
-  // if we have a listener on 'error' even if we are using CPS
-  if (!this.callback || this.listeners('error').length) {
-    this.emit('error', e);
-  }
-  this.errors.push(e);
-  if (typeof next === 'function') {
-    next();
-  } else {
-    this.handleEnd(this);
-  }
-};
-
-FeedParser.prototype.handleOpenTag = function (node){
-  var n = {};
-  n['#name'] = node.name; // Avoid namespace collissions later...
-  n['#prefix'] = node.prefix; // The current ns prefix
-  n['#local'] = node.local; // The current element name, sans prefix
-  n['#uri'] = node.uri; // The current ns uri
-  n['@'] = {};
-  n['#'] = '';
-
-  if (Object.keys(node.attributes).length) {
-    n['@'] = this.handleAttributes(node.attributes, n['#name']);
-  }
-
-  if (this.in_xhtml && this.xhtml['#name'] != n['#name']) { // We are in an xhtml node
-    // This builds the opening tag, e.g., <div id='foo' class='bar'>
-    this.xhtml['#'] += '<'+n['#name'];
-    Object.keys(n['@']).forEach(function(name){
-      this.xhtml['#'] += ' '+ name +'="'+ n['@'][name] + '"';
-    }, this);
-    this.xhtml['#'] += '>';
-  } else if ( this.stack.length === 0 &&
-              (n['#name'] === 'rss' ||
-              (n['#local'] === 'rdf' && utils.nslookup([n['#uri']], 'rdf')) ||
-              (n['#local'] === 'feed'&& utils.nslookup([n['#uri']], 'atom')) ) ) {
-    Object.keys(n['@']).forEach(function(name) {
-      var o = {};
-      if (name != 'version') {
-        o[name] = n['@'][name];
-        this.meta['@'].push(o);
-      }
-    }, this);
-    switch(n['#local']) {
-    case 'rss':
-      this.meta['#type'] = 'rss';
-      this.meta['#version'] = n['@']['version'];
-      break;
-    case 'rdf':
-      this.meta['#type'] = 'rdf';
-      this.meta['#version'] = n['@']['version'] || '1.0';
-      break;
-    case 'feed':
-      this.meta['#type'] = 'atom';
-      this.meta['#version'] = n['@']['version'] || '1.0';
-      break;
-    }
-  }
-  this.stack.unshift(n);
-};
-
-FeedParser.prototype.handleCloseTag = function (el){
-  var node = { '#name' : el
-             , '#prefix' : ''
-             , '#local' : '' }
-    , stdEl
-    , item
-    , baseurl
-    ;
-  var n = this.stack.shift();
-  el = el.split(':');
-
-  if (el.length > 1 && el[0] === n['#prefix']) {
-    if (utils.nslookup(n['#uri'], 'atom')) {
-      node['#prefix'] = el[0];
-      node['#local'] = el.slice(1).join(':');
-      node['#type'] = 'atom';
-    } else if (utils.nslookup(n['#uri'], 'rdf')) {
-      node['#prefix'] = el[0];
-      node['#local'] = el.slice(1).join(':');
-      node['#type'] = 'rdf';
-    } else {
-      node['#prefix'] = utils.nsprefix(n['#uri']) || n['#prefix'];
-      node['#local'] = el.slice(1).join(':');
-    }
-  } else {
-    node['#local'] = node['#name'];
-    node['#type'] = utils.nsprefix(n['#uri']) || n['#prefix'];
-  }
-  delete n['#name'];
-  delete n['#local'];
-  delete n['#prefix'];
-  delete n['#uri'];
-
-  if (this.xmlbase && this.xmlbase.length) {
-    baseurl = this.xmlbase[0]['#'];
-  }
-
-  if (baseurl && (node['#local'] === 'logo' || node['#local'] === 'icon') && node['#type'] === 'atom') {
-    // Apply xml:base to these elements as they appear
-    // rather than leaving it to the ultimate parser
-    n['#'] = utils.resolve(baseurl, n['#']);
-  }
-
-  if (this.xmlbase.length && (el == this.xmlbase[0]['#name'])) {
-    void this.xmlbase.shift();
-  }
-
-  if (this.in_xhtml) {
-    if (node['#name'] == this.xhtml['#name']) { // The end of the XHTML
-
-      // Add xhtml data to the container element
-      n['#'] += this.xhtml['#'].trim();
-        // Clear xhtml nodes from the tree
-        for (var key in n) {
-          if (key != '@' && key != '#') {
-            delete n[key];
-          }
-        }
-      this.xhtml = {};
-      this.in_xhtml = false;
-    } else { // Somewhere in the middle of the XHTML
-      this.xhtml['#'] += '</' + node['#name'] + '>';
-    }
-  }
-
-  if ('#' in n) {
-    if (n['#'].match(/^\s*$/)) {
-      // Delete text nodes with nothing by whitespace
-      delete n['#'];
-    } else {
-      n['#'] = n['#'].trim();
-      if (Object.keys(n).length === 1) {
-        // If there is only one text node, hoist it
-        n = n['#'];
-      }
-    }
-  }
-
-  if (node['#name'] === 'item' ||
-      node['#name'] === 'entry' ||
-      (node['#local'] === 'item' && (node['#prefix'] === '' || node['#type'] === 'rdf')) ||
-      (node['#local'] == 'entry' && (node['#prefix'] === '' || node['#type'] === 'atom'))) { // We have an article!
-
-    if (!this.meta.title) { // We haven't yet parsed all the metadata
-      utils.merge(this.meta, this.handleMeta(this.stack[0], this.meta['#type'], this.options));
-      this.emit('meta', this.meta);
-    }
-    if (!baseurl && this.xmlbase && this.xmlbase.length) { // handleMeta was able to infer a baseurl without xml:base or options.feedurl
-      n = reresolve(n, this.xmlbase[0]['#']);
-    }
-    item = this.handleItem(n, this.meta['#type'], this.options);
-    if (this.options.addmeta) {
-      item.meta = this.meta;
-    }
-    if (this.meta.author && !item.author) item.author = this.meta.author;
-    this.emit('article', item);
-    this.articles.push(item);
-  } else if (!this.meta.title && // We haven't yet parsed all the metadata
-              (node['#name'] === 'channel' ||
-               node['#name'] === 'feed' ||
-               (node['#local'] === 'channel' && (node['#prefix'] === '' || node['#type'] === 'rdf')) ||
-               (node['#local'] === 'feed' && (node['#prefix'] === '' || node['#type'] === 'atom')) ) ) {
-    utils.merge(this.meta, this.handleMeta(n, this.meta['#type'], this.options));
-    this.emit('meta', this.meta);
-  }
-
-  if (this.stack.length > 0) {
-    if (node['#prefix'] && node['#local'] && !node['#type']) {
-      stdEl = node['#prefix'] + ':' + node['#local'];
-    } else {
-      stdEl = node['#local'] || node['#name'];
-    }
-    if (!this.stack[0].hasOwnProperty(stdEl)) {
-      this.stack[0][stdEl] = n;
-    } else if (this.stack[0][stdEl] instanceof Array) {
-      this.stack[0][stdEl].push(n);
-    } else {
-      this.stack[0][stdEl] = [this.stack[0][stdEl], n];
-    }
-  } else {
-    this.nodes = n;
-  }
-};
-
-FeedParser.prototype.handleText = function (text){
-  if (this.in_xhtml) {
-    this.xhtml['#'] += text;
-  } else {
-    if (this.stack.length) {
-      if ('#' in this.stack[0]) {
-        this.stack[0]['#'] += text;
-      } else {
-        this.stack[0]['#'] = text;
-      }
-    }
-  }
-};
-
 FeedParser.prototype._reset = function (){
   this.meta = {};
   this.meta['#ns'] = [];
@@ -1009,3 +977,35 @@ FeedParser.prototype._setCallback = function (callback){
 };
 
 exports = module.exports = FeedParser;
+
+function reresolve (node, baseurl) {
+
+  if (!node || !baseurl) {
+    return false; // Nothing to do.
+  }
+
+  function resolveLevel (level) {
+    var els = Object.keys(level);
+    els.forEach(function(el){
+      if (Array.isArray(level[el])) {
+        level[el].forEach(resolveLevel);
+      } else {
+        if (level[el].constructor.name === 'Object') {
+          if (el == 'logo' || el == 'icon') {
+            level[el]['#'] = utils.resolve(baseurl, level[el]['#']);
+          } else {
+            var attrs = Object.keys(level[el]);
+            attrs.forEach(function(name){
+              if (name == 'href' || name == 'src' || name == 'uri') {
+                level[el][name] = utils.resolve(baseurl, level[el][name]);
+              }
+            });
+          }
+        }
+      }
+    });
+    return level;
+  }
+
+  return resolveLevel(node);
+}
